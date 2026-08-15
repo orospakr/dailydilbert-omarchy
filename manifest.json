@@ -1,0 +1,29 @@
+{
+  "schemaVersion": 1,
+  "id": "andrew.daily-dilbert",
+  "name": "DailyDilbert",
+  "version": "1.0.0",
+  "author": "andrew",
+  "description": "A deterministic daily random Dilbert strip from a local archive",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "DailyDilbert",
+    "description": "A deterministic daily random Dilbert strip from a local archive",
+    "category": "Info",
+    "allowMultiple": false,
+    "defaultSection": "center",
+    "defaults": {
+      "comicsDir": "~/.local/share/dilbert",
+      "icon": "󰊪"
+    },
+    "schema": [
+      { "key": "comicsDir", "type": "string", "label": "Comics directory" },
+      { "key": "icon", "type": "string", "label": "Bar icon glyph" }
+    ]
+  }
+}
