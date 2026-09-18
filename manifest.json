@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "andrew.daily-dilbert",
   "name": "DailyDilbert",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "author": "andrew",
   "description": "A deterministic daily random Dilbert strip from a local archive",
   "kinds": [

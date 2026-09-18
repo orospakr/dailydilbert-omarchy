@@ -25,6 +25,16 @@ bar; clicking it opens a panel with today's strip.
 - **Time travel** — arrow keys browse what the widget showed (or will
   show) on neighbouring days; reopening the panel always returns to
   today. The strip also rolls over automatically at midnight.
+- **Search** — `/` reveals a field that matches keywords and dates
+  against the filenames (all whitespace-separated tokens must match, so
+  `coffee meeting` narrows and `1998-03` picks a month). The highlighted
+  result is previewed live in the panel — arrow through the matches and
+  the strip, date and caption follow — and Esc reverts to whatever was
+  showing before. Pick a result and it replaces the day's strip until
+  you press `T`.
+- **Copy to clipboard** — `C` puts the strip on the Wayland clipboard as
+  a PNG (the GIF's first frame), which is what other applications
+  actually accept on paste.
 
 ## Interactions
 
@@ -33,9 +43,18 @@ bar; clicking it opens a panel with today's strip.
 | Left-click pill | Toggle panel |
 | `←` / `→` | Show neighbouring days' picks |
 | `T` / Enter / click strip | Back to today |
+| `C` / 󰆏 button | Copy the displayed strip to the clipboard as PNG |
+| `/` / 󰍉 button | Reveal the search field |
+| `↑` / `↓` / hover (search) | Move through the results, previewing each |
+| Enter (search) | Keep the previewed result |
+| Esc (search) | Clear the query, close the field, revert the preview |
 | Middle-click pill / `R` | Rescan the archive |
 | Esc | Close panel |
 | Tab / Shift-Tab | Switch to adjacent bar panels |
+
+Copying needs `wl-clipboard` (`wl-copy`) and `imagemagick` (`magick`)
+on `PATH`; without ImageMagick the raw GIF is put on the clipboard
+instead.
 
 ## Install
 

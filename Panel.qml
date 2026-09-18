@@ -32,14 +32,14 @@ Panel {
     openedFromHotkey = false
     setCenterHoverRevealSuppressed(false)
     root.syncToday()
-    root.dayOffset = 0
+    root.showToday()
     root.controller.show()
   }
 
   function openFromHotkey() {
     openedFromHotkey = true
     root.syncToday()
-    root.dayOffset = 0
+    root.showToday()
     root.controller.show()
     // Set after showing: showing hands the popout coordinator over, which
     // closes whichever panel was open, and that close clears the shared flag.
@@ -93,6 +93,12 @@ Panel {
   property bool scanning: false
   property bool scanFailed: false
 
+  // Search index, parallel to `comics`: lowercased basename stems with the
+  // extension dropped and `_` turned back into spaces. Built once per scan so
+  // a keystroke costs one indexOf per entry per token instead of a regex.
+  // The date prefix stays in, which is what lets "1998-03" match a month.
+  property var haystacks: []
+
   function refresh() {
     if (scanning) return
     scanning = true
@@ -109,8 +115,13 @@ Panel {
     // Code-unit sort, not localeCompare: identical ordering on every machine
     // regardless of locale, which the deterministic pick depends on.
     files.sort(function(a, b) { return a < b ? -1 : (a > b ? 1 : 0) })
+    var hays = []
+    for (var k = 0; k < files.length; k++)
+      hays.push(root.stemOf(files[k]).replace(/_/g, " ").toLowerCase())
     root.scanFailed = files.length === 0
     root.comics = files
+    root.haystacks = hays
+    root.runSearch()
   }
 
   // ------------------------------------------------------------ selection
@@ -148,7 +159,19 @@ Panel {
     return (h >>> 0) % count
   }
 
-  readonly property string comicPath: comics.length > 0 ? comics[pickIndex(selectedStamp, comics.length)] : ""
+  // A search pick overrides the day's hashed strip until something resets it
+  // (T / Enter / clicking the strip / reopening the panel / stepping days).
+  property string overridePath: ""
+
+  // Precedence: the transient search preview (only while the search is open)
+  // beats a picked override, which beats the day's hashed strip. Everything
+  // on display — header date, caption, image, copy — reads this one property,
+  // so the preview needs no separate plumbing.
+  readonly property string comicPath: previewPath !== ""
+    ? previewPath
+    : (overridePath !== ""
+      ? overridePath
+      : (comics.length > 0 ? comics[pickIndex(selectedStamp, comics.length)] : ""))
 
   readonly property string comicUrl: {
     if (comicPath === "") return ""
@@ -159,34 +182,194 @@ Panel {
 
   // Filenames are "<yyyy-mm-dd>_<keyword>_<keyword>….gif"; the date is the
   // strip's original run date, the keywords make a serviceable caption.
-  readonly property string comicBasename: {
-    var idx = comicPath.lastIndexOf("/")
-    return idx >= 0 ? comicPath.substring(idx + 1) : comicPath
+  // These are plain functions, not bindings, because the search result rows
+  // need the same labels for paths other than the displayed one.
+  function baseNameOf(path) {
+    var idx = path.lastIndexOf("/")
+    return idx >= 0 ? path.substring(idx + 1) : path
   }
 
-  readonly property string stripDateLabel: {
-    var m = comicBasename.match(/^(\d{4})-(\d{2})-(\d{2})/)
+  function stemOf(path) {
+    return baseNameOf(path).replace(/\.[A-Za-z0-9]+$/, "")
+  }
+
+  function dateLabelOf(path) {
+    var m = baseNameOf(path).match(/^(\d{4})-(\d{2})-(\d{2})/)
     if (!m) return ""
     var d = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]))
     return Qt.formatDate(d, "dddd, d MMMM yyyy")
   }
 
-  readonly property string keywordsLabel: {
-    var stem = comicBasename.replace(/\.[A-Za-z0-9]+$/, "")
-    var m = stem.match(/^\d{4}-\d{2}-\d{2}[_ ]?(.*)$/)
+  function keywordsOf(path) {
+    var m = stemOf(path).match(/^\d{4}-\d{2}-\d{2}[_ ]?(.*)$/)
     if (!m || m[1] === "") return ""
     return m[1].split("_").filter(function(k) { return k.trim() !== "" }).join(" · ")
   }
 
-  readonly property string selectionLabel: dayOffset === 0
-    ? "Today"
-    : Qt.formatDate(selectedDate, "ddd d MMM") + " (" + (dayOffset > 0 ? "+" : "") + dayOffset + "d)"
+  readonly property string comicBasename: baseNameOf(comicPath)
+  readonly property string stripDateLabel: dateLabelOf(comicPath)
+  readonly property string keywordsLabel: keywordsOf(comicPath)
+
+  readonly property string selectionLabel: previewPath !== ""
+    ? "Preview"
+    : (overridePath !== ""
+    ? "Search result"
+    : (dayOffset === 0
+      ? "Today"
+      : Qt.formatDate(selectedDate, "ddd d MMM") + " (" + (dayOffset > 0 ? "+" : "") + dayOffset + "d)"))
 
   readonly property string statusNote: {
     if (scanning && comics.length === 0) return "Scanning archive…"
     if (scanFailed) return "No comics found in " + comicsDirSetting
     if (comics.length === 0) return "Loading…"
     return stripDateLabel
+  }
+
+  function showToday() {
+    root.overridePath = ""
+    root.dayOffset = 0
+    root.cancelSearch()
+  }
+
+  // --------------------------------------------------------------- search
+  //
+  // Revealed by `/` or the magnify button. While it is open the key catcher
+  // is blocked so plain letters land in the field instead of firing the
+  // r/t/h/j/k/l shortcuts; the field itself handles Esc/↑/↓/Enter.
+  property bool searchOpen: false
+  property string searchQuery: ""
+  property var searchResults: []
+  property int searchMatchCount: 0
+  property int searchIndex: -1
+  readonly property int searchLimit: 8
+
+  // The highlighted row, shown in the strip area while browsing. Purely
+  // derived: closing the search (Esc, the button, reopening the panel) drops
+  // it and the strip falls back to the override or the day's pick with no
+  // bookkeeping. Enter/click is what makes a pick stick, via overridePath.
+  readonly property string previewPath: searchOpen
+    && searchIndex >= 0 && searchIndex < searchResults.length
+    ? searchResults[searchIndex]
+    : ""
+
+  // Focus moves by hand in both directions: the field has to steal it from
+  // the panel's focusTarget, and giving it back is what makes the second Esc
+  // close the panel the way it always did.
+  function openSearch() {
+    root.searchOpen = true
+    Qt.callLater(function() { searchField.forceActiveFocus() })
+  }
+
+  function closeSearch() {
+    if (!root.searchOpen) return
+    root.searchOpen = false
+    keyCatcher.forceActiveFocus()
+  }
+
+  // Dismissing (Esc, the button again, reopening the panel) also drops the
+  // query; only picking a result keeps it, so `/` reopens where you left off.
+  function cancelSearch() {
+    searchField.text = ""
+    root.closeSearch()
+  }
+
+  // AND semantics over whitespace-split tokens. 12k substring probes per
+  // token is cheap enough that the 120 ms debounce is about typing comfort,
+  // not CPU. Every match is counted but only `searchLimit` rows are built,
+  // because reassigning the Repeater model recreates every delegate.
+  function runSearch() {
+    var q = String(root.searchQuery).trim().toLowerCase()
+    if (q === "") {
+      root.searchResults = []
+      root.searchMatchCount = 0
+      root.searchIndex = -1
+      return
+    }
+    var tokens = q.split(/\s+/)
+    var out = []
+    var count = 0
+    for (var i = 0; i < root.haystacks.length; i++) {
+      var hay = root.haystacks[i]
+      var ok = true
+      for (var j = 0; j < tokens.length; j++) {
+        if (hay.indexOf(tokens[j]) < 0) { ok = false; break }
+      }
+      if (!ok) continue
+      count++
+      if (out.length < root.searchLimit) out.push(root.comics[i])
+    }
+    root.searchMatchCount = count
+    root.searchResults = out
+    root.searchIndex = out.length > 0 ? 0 : -1
+  }
+
+  function moveSearchIndex(delta) {
+    if (root.searchResults.length === 0) return
+    var n = root.searchResults.length
+    root.searchIndex = ((root.searchIndex + delta) % n + n) % n
+  }
+
+  function acceptSearch() {
+    if (root.searchResults.length === 0) return
+    var idx = root.searchIndex >= 0 ? root.searchIndex : 0
+    root.selectResult(root.searchResults[idx])
+  }
+
+  // The query text survives on purpose, so `/` reopens where you left off.
+  function selectResult(path) {
+    root.overridePath = path
+    root.closeSearch()
+  }
+
+  Timer {
+    id: searchDebounce
+    interval: 120
+    repeat: false
+    onTriggered: root.runSearch()
+  }
+
+  onSearchQueryChanged: searchDebounce.restart()
+
+  // ----------------------------------------------------------------- copy
+  //
+  // The strip path goes in as an argv positional ("$1"), never interpolated:
+  // archive filenames are full of spaces and the odd apostrophe. magick's
+  // "[0]" takes the first frame, and PNG is what other apps actually accept
+  // off the clipboard — the raw GIF is the fallback when magick isn't there.
+  readonly property string copyScript:
+    "set -o pipefail\n" +
+    "if magick \"$1[0]\" png:- | wl-copy -t image/png; then exit 0; fi\n" +
+    "wl-copy -t \"$(file --mime-type -b \"$1\")\" < \"$1\"\n"
+
+  property string copyStatus: ""
+  readonly property bool canCopy: root.comicPath !== "" && !copier.running
+
+  function copyStrip() {
+    if (!root.canCopy) return
+    copier.command = ["bash", "-c", root.copyScript, "_", root.comicsRoot + "/" + root.comicPath]
+    copier.running = true
+  }
+
+  Process {
+    id: copier
+    property string errorText: ""
+
+    onExited: function(exitCode, exitStatus) {
+      root.copyStatus = exitCode === 0 ? "Copied" : "Copy failed"
+      if (exitCode !== 0) console.log("daily-dilbert copy failed:", exitCode, copier.errorText)
+      copyStatusTimer.restart()
+    }
+
+    stderr: StdioCollector {
+      onStreamFinished: copier.errorText = String(text || "").trim()
+    }
+  }
+
+  Timer {
+    id: copyStatusTimer
+    interval: 1500
+    repeat: false
+    onTriggered: root.copyStatus = ""
   }
 
   // ---------------------------------------------------------------- scan
@@ -259,15 +442,24 @@ Panel {
     PanelKeyCatcher {
       id: keyCatcher
       anchors.fill: parent
+      // While the search field owns input every key belongs to it, including
+      // the letters this catcher would otherwise claim as shortcuts.
+      blocked: root.searchOpen
+
       onCloseRequested: root.close()
       onTabRequested: function(direction) { root.switchPanel(direction) }
-      onActivateRequested: root.dayOffset = 0
+      onActivateRequested: root.showToday()
       onMoveRequested: function(dx, dy) {
-        if (dx !== 0) root.dayOffset += dx
+        if (dx !== 0) {
+          root.overridePath = ""
+          root.dayOffset += dx
+        }
       }
       onTextKey: function(t) {
         if (t === "r" || t === "R") root.refresh()
-        else if (t === "t" || t === "T") root.dayOffset = 0
+        else if (t === "t" || t === "T") root.showToday()
+        else if (t === "c" || t === "C") root.copyStrip()
+        else if (t === "/") root.openSearch()
       }
 
       Column {
@@ -297,22 +489,159 @@ Panel {
           foreground: root.foreground
         }
 
+        // ---- Revealable search. Invisible children take no space in a
+        // Column, so the panel's contentHeight (bound to column.implicitHeight)
+        // collapses back on its own when the section hides.
+        Column {
+          id: searchSection
+          width: parent.width
+          visible: root.searchOpen
+          spacing: Style.space(6)
+
+          TextField {
+            id: searchField
+            width: parent.width
+            placeholderText: "Search keywords or date…"
+            foreground: root.foreground
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.body
+            horizontalPadding: Style.spacing.controlGap
+            verticalPadding: Style.spacing.controlPaddingY
+
+            onTextChanged: root.searchQuery = text
+
+            // Return is handled here rather than through TextField's
+            // `accepted` signal: QQC2 leaves the key unaccepted so dialogs can
+            // see it, and by the time the selection has closed the search the
+            // catcher is unblocked again — the same press would reach it as
+            // "activate" and immediately reset the pick back to today.
+            Keys.onReturnPressed: function(event) { root.acceptSearch(); event.accepted = true }
+            Keys.onEnterPressed: function(event) { root.acceptSearch(); event.accepted = true }
+            Keys.onEscapePressed: function(event) { root.cancelSearch(); event.accepted = true }
+            Keys.onUpPressed: root.moveSearchIndex(-1)
+            Keys.onDownPressed: root.moveSearchIndex(1)
+            // Swallow Tab: the panel's Tab means "switch bar panel", and
+            // letting focus walk out of the field while the catcher is
+            // blocked would strand the keyboard with nothing listening.
+            Keys.onTabPressed: function(event) { event.accepted = true }
+            Keys.onBacktabPressed: function(event) { event.accepted = true }
+          }
+
+          Text {
+            width: parent.width
+            visible: root.searchQuery.trim() !== ""
+            text: root.searchMatchCount === 0
+              ? "No matches"
+              : (root.searchMatchCount > root.searchLimit
+                ? root.searchMatchCount + " matches · showing first " + root.searchLimit
+                : root.searchMatchCount + (root.searchMatchCount === 1 ? " match" : " matches"))
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+          }
+
+          Repeater {
+            model: root.searchResults
+
+            CursorSurface {
+              id: resultRow
+              width: searchSection.width
+              height: Style.space(24)
+              foreground: root.foreground
+              accent: Color.accent
+              hasCursor: index === root.searchIndex
+
+              Text {
+                id: resultDate
+                anchors.left: parent.left
+                anchors.leftMargin: Style.spacing.sm
+                anchors.verticalCenter: parent.verticalCenter
+                text: root.dateLabelOf(modelData)
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+              }
+
+              // Fill-remaining, never a fixed width: fittedContentWidth can
+              // clamp the panel narrower than the requested comic width.
+              Text {
+                anchors.left: resultDate.right
+                anchors.leftMargin: Style.spacing.md
+                anchors.right: parent.right
+                anchors.rightMargin: Style.spacing.sm
+                anchors.verticalCenter: parent.verticalCenter
+                horizontalAlignment: Text.AlignRight
+                text: root.keywordsOf(modelData)
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                elide: Text.ElideRight
+              }
+
+              MouseArea {
+                anchors.fill: parent
+                hoverEnabled: true
+                cursorShape: Qt.PointingHandCursor
+                onContainsMouseChanged: if (containsMouse) root.searchIndex = index
+                onClicked: root.selectResult(modelData)
+              }
+            }
+          }
+        }
+
         // ---- The strip. White matte behind the image: the scans have white
         // backgrounds, so on dark themes a bare image floats as a harsh
         // rectangle anyway — owning the matte with padding looks deliberate.
         Rectangle {
           id: comicFrame
           width: parent.width
-          height: strip.status === Image.Ready
-            ? strip.paintedHeight + Style.space(24)
+
+          // Arrowing through search results swaps the source on every press.
+          // Qt drops the old pixmap the moment an asynchronous load starts, so
+          // without this the frame would blank and snap to the 220px fallback
+          // on every keystroke. While a swap is in flight we keep the previous
+          // frame painted (stripBack) and hold the last ready height.
+          readonly property bool hasFrame: strip.status === Image.Ready
+            || (strip.status === Image.Loading && strip.lastPaintedHeight > 0)
+
+          height: comicFrame.hasFrame
+            ? (strip.status === Image.Ready ? strip.paintedHeight : strip.lastPaintedHeight) + Style.space(24)
             : Style.space(220)
           radius: Style.cornerRadius
           color: "#ffffff"
           border.width: 1
           border.color: Style.normalBorderFor(root.foreground, Color.accent)
 
+          // Back buffer: it trails one strip behind, because its source only
+          // advances when the front image reports Ready. That makes it the
+          // last painted frame, which is exactly what should stay on screen
+          // while the front image loads the next one (cache hit, so it is
+          // already decoded — no crossfade, nothing to pay for).
+          Image {
+            id: stripBack
+            anchors.horizontalCenter: parent.horizontalCenter
+            anchors.verticalCenter: parent.verticalCenter
+            width: strip.width
+            fillMode: Image.PreserveAspectFit
+            asynchronous: true
+            cache: true
+            source: strip.lastReadyUrl
+            visible: strip.status === Image.Loading && stripBack.status === Image.Ready
+          }
+
           Image {
             id: strip
+            property string lastReadyUrl: ""
+            property real lastPaintedHeight: 0
+
+            // Remembered on the way past Ready: paintedHeight settles after
+            // the status change, so watch both.
+            function noteReady() {
+              if (strip.status !== Image.Ready) return
+              if (strip.paintedHeight > 0) strip.lastPaintedHeight = strip.paintedHeight
+              strip.lastReadyUrl = String(strip.source)
+            }
+
             anchors.horizontalCenter: parent.horizontalCenter
             anchors.verticalCenter: parent.verticalCenter
             width: parent.width - Style.space(24)
@@ -321,11 +650,15 @@ Panel {
             cache: true
             source: root.comicUrl
             visible: status === Image.Ready
+            onStatusChanged: strip.noteReady()
+            onPaintedHeightChanged: strip.noteReady()
           }
 
+          // Only when there really is nothing to show: a failed load, an empty
+          // archive, or before the first strip has ever painted.
           Text {
             anchors.centerIn: parent
-            visible: strip.status !== Image.Ready
+            visible: !comicFrame.hasFrame
             text: strip.status === Image.Error ? "Could not load strip" :
                   (root.scanFailed ? "Archive not found" : "Loading…")
             color: "#666666"
@@ -338,8 +671,9 @@ Panel {
             cursorShape: Qt.PointingHandCursor
             acceptedButtons: Qt.LeftButton | Qt.MiddleButton
             onClicked: function(mouse) {
+              // Middle-click rescans without disturbing a search pick.
               if (mouse.button === Qt.MiddleButton) root.refresh()
-              else root.dayOffset = 0
+              else root.showToday()
             }
           }
         }
@@ -357,29 +691,66 @@ Panel {
           elide: Text.ElideRight
         }
 
-        // ---- Footer: archive size left, interaction hint right.
+        // ---- Footer: archive size left, hint + actions right. The count is
+        // anchored against the action row rather than given a width, so a
+        // panel clamped narrow by fittedContentWidth elides the caption
+        // instead of pushing the buttons off the edge.
         Item {
           width: parent.width
-          implicitHeight: Math.max(countLabel.implicitHeight, hint.implicitHeight)
+          implicitHeight: Math.max(countLabel.implicitHeight, actions.implicitHeight)
 
           Text {
             id: countLabel
             anchors.left: parent.left
+            anchors.right: actions.left
+            anchors.rightMargin: Style.spacing.md
             anchors.verticalCenter: parent.verticalCenter
             text: root.comics.length > 0 ? root.comics.length + " strips · Dilbert by Scott Adams" : ""
             color: root.dim
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption
+            elide: Text.ElideRight
           }
 
-          Text {
-            id: hint
+          Row {
+            id: actions
             anchors.right: parent.right
             anchors.verticalCenter: parent.verticalCenter
-            text: root.dayOffset === 0 ? "←/→ other days · R rescan" : "←/→ step · T today"
-            color: root.dim
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.caption
+            spacing: Style.spacing.sm
+
+            Text {
+              id: hint
+              anchors.verticalCenter: parent.verticalCenter
+              text: root.copyStatus !== ""
+                ? root.copyStatus
+                : (root.overridePath !== "" || root.dayOffset !== 0
+                  ? "←/→ step · T today · C copy"
+                  : "←/→ days · / search · C copy")
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+            }
+
+            PanelActionButton {
+              anchors.verticalCenter: parent.verticalCenter
+              iconText: "󰍉"  // nf-md-magnify
+              tooltipText: "Search the archive"
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+              onClicked: root.searchOpen ? root.cancelSearch() : root.openSearch()
+            }
+
+            PanelActionButton {
+              anchors.verticalCenter: parent.verticalCenter
+              iconText: root.copyStatus === "Copied" ? "󰄬" : "󰆏"  // nf-md-check / content_copy
+              tooltipText: "Copy strip to clipboard"
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+              // hasFrame, not Image.Ready: a source swap mid-browse shouldn't
+              // blink the button out for the length of a load.
+              enabled: root.canCopy && comicFrame.hasFrame
+              onClicked: root.copyStrip()
+            }
           }
         }
       }
